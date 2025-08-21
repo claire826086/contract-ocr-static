@@ -1,14 +1,18 @@
 // app.js - PaddleOCR det 模型測試版
-
-// 安全保護
 if (window.ort) {
-  // 讓 ORT 自己去 CDN 抓對應的 .mjs/.wasm
-  console.log('ORT ready. wasmPaths =', ort.env.wasm.wasmPaths, 'backend:', ort.env.wasm);
-  ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
-  ort.env.wasm.numThreads = 1; // iPhone 最保險：不使用 threaded 變體
+  // 1) 只用非 threaded 的 SIMDe 檔案（避免抓 simd-threaded.jsep.mjs）
+  ort.env.wasm.wasmPaths = {
+    wasm: "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort-wasm-simd.wasm",
+    mjs:  "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort-wasm-simd.jsep.mjs"
+  };
+  // 2) 明確關閉多執行緒
+  ort.env.wasm.numThreads = 1;
+  // 3)（可選）關閉 proxy/worker，用主執行緒跑，進一步減少 CSP/worker 變因
+  ort.env.wasm.proxy = false;
 } else {
   console.warn("onnxruntime-web 未載入");
 }
+
 const fileInput = document.getElementById("fileInput");
 const preview = document.getElementById("preview");
 const ocrBtn = document.getElementById("ocrBtn");
