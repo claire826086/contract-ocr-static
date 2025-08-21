@@ -4,22 +4,26 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Contract OCR (PWA)</title>
+
+  <!-- PWA basics -->
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#0ea5e9">
+  <meta name="mobile-web-app-capable" content="yes">
+  <!-- 可留著舊的 apple-*，但 Safari 會顯示 deprecated 警告；不影響功能 -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <!-- 補站台 icon，避免 favicon.ico 404 -->
+  <link rel="icon" href="icons/icon-192.png">
+
+  <!-- CSP：允許 jsDelivr & 你的 Pages 網域；允許 wasm instantiate -->
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'self';
              img-src 'self' blob: data:;
              script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval' 'unsafe-eval';
              style-src 'self' 'unsafe-inline';
-             connect-src 'self' https://cdn.jsdelivr.net https://github.com https://objects.githubusercontent.com;
+             connect-src 'self' https://cdn.jsdelivr.net https://claire826086.github.io;
              worker-src 'self' blob:;">
-
-
-
-
 
   <link rel="stylesheet" href="style.css">
 </head>
@@ -28,22 +32,26 @@
     <h1>Contract OCR（離線 PWA 範例）</h1>
     <p class="muted">這個 App 可以安裝到 iPhone。照片只在本機處理，不會上傳。</p>
   </header>
+
   <main>
     <section class="card">
       <h2>步驟 1：選擇或拍攝合約照片</h2>
       <input id="fileInput" type="file" accept="image/*" capture="environment">
       <p class="help">選完後，App 會先移除 EXIF，再顯示到下方預覽區。</p>
     </section>
+
     <section class="card">
       <h2>預覽（已移除 EXIF）</h2>
-      <img id="preview" style="max-width: 100%; margin-top: 10px;">
+      <img id="preview" style="max-width: 100%; margin-top: 10px;" alt="預覽">
       <p id="info" class="muted"></p>
     </section>
+
     <section class="card">
       <h2>OCR 測試</h2>
       <button id="ocrBtn">開始 OCR</button>
       <pre id="result"></pre>
     </section>
+
     <section class="card">
       <h2>如何安裝到 iPhone</h2>
       <ol>
@@ -53,10 +61,13 @@
       </ol>
     </section>
   </main>
+
   <footer>
     <small>© 2025 Contract OCR PWA • 完全離線示範</small>
   </footer>
+
+  <!-- 先載 ORT，再載你的 app.js（加版本號避免快取） -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=11"></script>
 </body>
 </html>
