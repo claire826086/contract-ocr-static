@@ -3,6 +3,7 @@
 // 安全保護
 if (window.ort) {
   // 讓 ORT 自己去 CDN 抓對應的 .mjs/.wasm
+  console.log('ORT ready. wasmPaths =', ort.env.wasm.wasmPaths, 'backend:', ort.env.wasm);
   ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
 } else {
   console.warn("onnxruntime-web 未載入");
@@ -40,7 +41,8 @@ ocrBtn.addEventListener("click", async () => {
     }
     result.innerText = "✅ 模型載入完成，開始推論...";
     const inputTensor = imageToTensor(imageElement);
-    const feeds = { "x": inputTensor };
+    const feeds = {};
+    feeds[detSession.inputNames[0]] = inputTensor;
     const outputs = await detSession.run(feeds);
     console.log("Det 模型輸出:", outputs);
     result.innerText = "✅ 推論完成！請打開 Console 查看輸出結果。";
