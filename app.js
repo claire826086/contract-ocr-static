@@ -1,10 +1,11 @@
 // app.js - PaddleOCR det 模型測試版
 
-// 安全保護：就算 window.ort 還沒載到，也讓預覽/事件先能運作
+// 安全保護
 if (window.ort) {
-  ort.env.wasm.wasmPaths = "./wasm/";
+  // 讓 ORT 自己去 CDN 抓對應的 .mjs/.wasm
+  ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
 } else {
-  console.warn("onnxruntime-web 未載入（先讓 UI 照常運作，按開始時再提醒）");
+  console.warn("onnxruntime-web 未載入");
 }
 const fileInput = document.getElementById("fileInput");
 const preview = document.getElementById("preview");
@@ -32,7 +33,10 @@ ocrBtn.addEventListener("click", async () => {
   result.innerText = "🔄 載入模型中...";
   try {
     if (!detSession) {
-      detSession = await ort.InferenceSession.create("https://github.com/claire826086/contract-ocr-static/releases/download/v0.1/det.onnx");
+      detSession = await ort.InferenceSession.create(
+        "https://github.com/claire826086/contract-ocr-static/releases/download/v0.1/det.onnx",
+        { executionProviders: ['wasm'] } // 只用 WASM，避免 webgpu/webnn 嘗試
+      );
     }
     result.innerText = "✅ 模型載入完成，開始推論...";
     const inputTensor = imageToTensor(imageElement);
