@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Contract OCR (PWA)</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#0ea5e9">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' blob: data:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; worker-src 'self' blob:;">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Contract OCR（離線 PWA 範例）</h1>
+    <p class="muted">這個 App 可以安裝到 iPhone。照片只在本機處理，不會上傳。</p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>步驟 1：選擇或拍攝合約照片</h2>
+      <input id="fileInput" type="file" accept="image/*" capture="environment">
+      <p class="help">選完後，App 會先移除 EXIF，再顯示到下方預覽區。</p>
+    </section>
+    <section class="card">
+      <h2>預覽（已移除 EXIF）</h2>
+      <img id="preview" style="max-width: 100%; margin-top: 10px;">
+      <p id="info" class="muted"></p>
+    </section>
+    <section class="card">
+      <h2>OCR 測試</h2>
+      <button id="ocrBtn">開始 OCR</button>
+      <pre id="result"></pre>
+    </section>
+    <section class="card">
+      <h2>如何安裝到 iPhone</h2>
+      <ol>
+        <li>用 <strong>Safari</strong> 開啟此網站。</li>
+        <li>點下方的<strong>分享</strong>按鈕。</li>
+        <li>選<strong>加入主畫面</strong>。</li>
+      </ol>
+    </section>
+  </main>
+  <footer>
+    <small>© 2025 Contract OCR PWA • 完全離線示範</small>
+  </footer>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

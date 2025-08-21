@@ -1,0 +1,8 @@
+body { font-family: sans-serif; margin: 0; padding: 0; background: #f8fafc; color: #111; }
+header, footer { background: #0ea5e9; color: white; padding: 1em; text-align: center; }
+main { padding: 1em; max-width: 600px; margin: auto; }
+.card { background: white; padding: 1em; margin-bottom: 1em; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+button { padding: 0.5em 1em; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer; }
+button:hover { background: #0284c7; }
+pre { background: #f1f5f9; padding: 0.5em; overflow-x: auto; }
+.muted { color: #555; font-size: 0.9em; }
