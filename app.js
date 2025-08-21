@@ -1,17 +1,14 @@
 // app.js - PaddleOCR det 模型測試版
 if (window.ort) {
-  // 1) 只用非 threaded 的 SIMDe 檔案（避免抓 simd-threaded.jsep.mjs）
-  ort.env.wasm.wasmPaths = {
-    wasm: "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort-wasm-simd.wasm",
-    mjs:  "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort-wasm-simd.jsep.mjs"
-  };
-  // 2) 明確關閉多執行緒
-  ort.env.wasm.numThreads = 1;
-  // 3)（可選）關閉 proxy/worker，用主執行緒跑，進一步減少 CSP/worker 變因
-  ort.env.wasm.proxy = false;
+  // 方案 1：讓 ORT 自己判斷，但關閉 SIMD、關閉 threads
+  ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+  ort.env.wasm.numThreads = 1;   // iOS 沒 threads
+  ort.env.wasm.simd = false;     // 強制不用 SIMD，避免簽章不符錯誤
+  // （可留著）ort.env.wasm.proxy = false; // 如有 worker/CSP 問題可加
 } else {
   console.warn("onnxruntime-web 未載入");
 }
+
 
 const fileInput = document.getElementById("fileInput");
 const preview = document.getElementById("preview");
