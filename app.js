@@ -26,7 +26,7 @@ ocrBtn.addEventListener("click", async () => {
   result.innerText = "🔄 載入模型中...";
   try {
     if (!detSession) {
-      detSession = await ort.InferenceSession.create("./models/det.onnx");
+      detSession = await ort.InferenceSession.create("https://github.com/claire826086/contract-ocr-static/releases/download/v0.1/det.onnx");
     }
     result.innerText = "✅ 模型載入完成，開始推論...";
     const inputTensor = imageToTensor(imageElement);
