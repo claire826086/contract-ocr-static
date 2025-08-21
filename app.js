@@ -1,5 +1,11 @@
 // app.js - PaddleOCR det 模型測試版
-ort.env.wasm.wasmPaths = "./wasm/";
+
+// 安全保護：就算 window.ort 還沒載到，也讓預覽/事件先能運作
+if (window.ort) {
+  ort.env.wasm.wasmPaths = "./wasm/";
+} else {
+  console.warn("onnxruntime-web 未載入（先讓 UI 照常運作，按開始時再提醒）");
+}
 const fileInput = document.getElementById("fileInput");
 const preview = document.getElementById("preview");
 const ocrBtn = document.getElementById("ocrBtn");
