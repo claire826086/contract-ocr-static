@@ -5,6 +5,7 @@ if (window.ort) {
   // 讓 ORT 自己去 CDN 抓對應的 .mjs/.wasm
   console.log('ORT ready. wasmPaths =', ort.env.wasm.wasmPaths, 'backend:', ort.env.wasm);
   ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+  ort.env.wasm.numThreads = 1; // iPhone 最保險：不使用 threaded 變體
 } else {
   console.warn("onnxruntime-web 未載入");
 }
