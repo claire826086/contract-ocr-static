@@ -1,5 +1,7 @@
-// app.js — PP-OCR (det→post→grid→(rec)) + 下載 Excel
-// 需要 index.html 先載入：onnxruntime-web、xlsx（SheetJS）
+// app.js — PP-OCR det→post→grid→(rec) + 匯出 Excel
+// 需於 index.html 先載入：
+// <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+// <script src="https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js"></script>
 
 // ====== ORT 設定 ======
 if (window.ort) {
@@ -38,7 +40,7 @@ let recSession = null;
 let keys = null; // rec 字典
 let imageElement = null;
 
-// 你的 GitHub Pages 模型 URL（自動取得當前根路徑）
+// 自動取當前 Pages 根路徑
 const BASE = location.origin + location.pathname.replace(/\/[^/]*$/, "/");
 const DET_URL  = BASE + "models/det.onnx";
 const REC_URL  = BASE + "models/rec.onnx";
@@ -116,7 +118,7 @@ function imageToDetTensor(img) {
 }
 
 // ====== det 後處理（閾值→連通區→外接矩形）======
-function probMapToBoxes(detTensor, thr=0.3, minArea=100) {
+function probMapToBoxes(detTensor, thr=0.2, minArea=50) {
   const [_, __, H, W] = detTensor.dims;
   const src = detTensor.data;
   const bin = new Uint8Array(H*W);
@@ -205,66 +207,106 @@ function groupToGrid(boxes, yTol=12, xTol=12){
   });
 }
 
-// ====== rec：讀字典 + CTC 解碼 ======
+// ====== rec：讀字典 + CTC 解碼（新版）======
 async function loadKeys() {
   const txt = await (await fetch(KEYS_URL, {cache:"force-cache"})).text();
-  return txt.split(/\r?\n/).filter(s=>s.length>0);
+  return txt
+    .split(/\r?\n/)
+    .map(s=>s.trim())
+    .filter(s => s.length>0 && !s.startsWith("#"));
 }
 
-function argmax(arr){ let idx=0, v=-Infinity; for (let i=0;i<arr.length;i++){ if(arr[i]>v){v=arr[i]; idx=i;} } return idx; }
 function ctcDecode(seq, keys, blankIndex=0){
   const out = [];
   let prev = -1;
   for (const k of seq){
-    if (k===blankIndex || k===prev) { prev = k; continue; }
-    prev = k; out.push(keys[k] ?? "");
+    if (k === blankIndex || k === prev) { prev = k; continue; }
+    prev = k;
+    out.push(keys[k] ?? "");
   }
   return out.join("");
 }
 
+// 核心：單格 rec（H=48、(x-0.5)/0.5、輸出形狀自動判定、blank 自動判定）
 async function recognizeCrop(canvas){
   if (!recSession || !keys) return "";
-  const targetH = 32, maxW = 320;
+
+  const targetH = 48, maxW = 512;
   const scale = targetH / canvas.height;
   let newW = Math.max(16, Math.min(maxW, Math.round(canvas.width * scale)));
+
   const c = document.createElement("canvas");
   c.width = newW; c.height = targetH;
   const g = c.getContext("2d");
-  g.fillStyle = "#fff"; g.fillRect(0,0,newW,targetH);
+
+  g.fillStyle = "#fff";
+  g.fillRect(0, 0, newW, targetH);
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = "high";
   g.drawImage(canvas, 0, 0, newW, targetH);
+
   const data = g.getImageData(0,0,newW,targetH).data;
   const f32 = new Float32Array(3*targetH*newW);
   let p = 0;
-  for (let y=0;y<targetH;y++){
-    for (let x=0;x<newW;x++){
-      const i=(y*newW+x)*4;
-      f32[0*targetH*newW + p] = data[i  ]/255;
-      f32[1*targetH*newW + p] = data[i+1]/255;
-      f32[2*targetH*newW + p] = data[i+2]/255;
+  for (let y=0; y<targetH; y++){
+    for (let x=0; x<newW; x++){
+      const i = (y*newW + x)*4;
+      const r = (data[i]   /255 - 0.5)/0.5;
+      const gg= (data[i+1] /255 - 0.5)/0.5;
+      const b = (data[i+2] /255 - 0.5)/0.5;
+      f32[0*targetH*newW + p] = r;
+      f32[1*targetH*newW + p] = gg;
+      f32[2*targetH*newW + p] = b;
       p++;
     }
   }
+
   const input = new ort.Tensor("float32", f32, [1,3,targetH,newW]);
   const feeds = {}; feeds[recSession.inputNames[0]] = input;
   const out = await recSession.run(feeds);
-  const name = Object.keys(out)[0];
-  const logits = out[name]; // [1, T, C] 或 [T, C]
-  const dims = logits.dims;
-  const dataLogits = logits.data;
-  let T, C;
-  if (dims.length===3){ T=dims[1]; C=dims[2]; }
-  else { T=dims[0]; C=dims[1]; }
-  const seq = new Array(T);
-  for (let t=0;t<T;t++){
-    // 取第 t 步的 C 類別，做 argmax
-    let maxV=-Infinity, maxI=0;
-    for (let c=0;c<C;c++){
-      const v = dataLogits[t*C + c];
-      if (v>maxV){ maxV=v; maxI=c; }
-    }
-    seq[t] = maxI;
+  const outName = Object.keys(out)[0];
+  const logits = out[outName];
+  const dims = logits.dims.slice();
+  const A = logits.data;
+
+  // 自動解讀 T、C 與取值方式
+  let T, C, step;
+  if (dims.length === 3 && dims[0] === 1 && dims[1] > 1 && dims[2] > 1) {
+    // [1, T, C]
+    T = dims[1]; C = dims[2];
+    step = (t,c) => A[t*C + c];
+  } else if (dims.length === 3 && dims[0] === 1 && dims[2] > 1 && dims[1] > 1) {
+    // [1, C, T]
+    C = dims[1]; T = dims[2];
+    step = (t,c) => A[c*T + t];
+  } else if (dims.length === 2 && dims[0] > 1 && dims[1] > 1) {
+    // [T, C]
+    T = dims[0]; C = dims[1];
+    step = (t,c) => A[t*C + c];
+  } else if (dims.length === 2 && dims[1] > 1 && dims[0] > 1) {
+    // [C, T]
+    C = dims[0]; T = dims[1];
+    step = (t,c) => A[c*T + t];
+  } else {
+    console.warn("未知 rec 輸出形狀", dims);
+    return "";
   }
-  return ctcDecode(seq, keys, 0);
+
+  // blank index：若 C = keys.length + 1，則多數模型把 blank 放在最後
+  let blankIndex = 0;
+  if (C === keys.length + 1) blankIndex = C - 1;
+
+  // 每步 argmax → CTC 解碼
+  const seq = new Array(T);
+  for (let t=0; t<T; t++){
+    let bestI = 0, bestV = -Infinity;
+    for (let c=0; c<C; c++){
+      const v = step(t,c);
+      if (v > bestV){ bestV=v; bestI=c; }
+    }
+    seq[t] = bestI;
+  }
+  return ctcDecode(seq, keys, blankIndex);
 }
 
 // ====== 視覺：畫框 ======
@@ -285,11 +327,10 @@ function drawBoxesOnImage(img, boxesOrig){
 // ====== 匯出 Excel ======
 function exportToXLSX(rowsText, filename="ocr_table.xlsx"){
   if (!window.XLSX) { alert("XLSX 函式庫未載入"); return; }
-  // rowsText: 二維陣列（每列是欄位陣列）
   const ws = XLSX.utils.aoa_to_sheet(rowsText);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
-  XLSX.writeFile(wb, filename); // 直接觸發下載
+  XLSX.writeFile(wb, filename);
 }
 
 // ====== 主流程：表格抽取 ======
@@ -310,8 +351,11 @@ tableBtn.addEventListener("click", async () => {
           const buf = await fetchWithProgress(REC_URL, "下載 rec.onnx");
           recSession = await ort.InferenceSession.create(buf, { executionProviders: ["wasm"] });
           keys = await loadKeys();
+          console.log("keys.length =", keys.length);
         }
-      } catch {}
+      } catch (e) {
+        console.warn("rec/keys 未啟用：", e);
+      }
     }
 
     // det 推論
@@ -323,7 +367,7 @@ tableBtn.addEventListener("click", async () => {
     const detMap = detOut[detName]; // [1,1,H,W]
 
     // 後處理 → 原圖座標
-    const boxes640 = probMapToBoxes(detMap, 0.3, 80);
+    const boxes640 = probMapToBoxes(detMap, 0.2, 50);
     const boxesOrig = boxes640.map(b => detBoxToOriginal(b, meta));
     drawBoxesOnImage(imageElement, boxesOrig);
 
@@ -354,7 +398,7 @@ tableBtn.addEventListener("click", async () => {
       rowsText.push(colsText);
     }
 
-    // 顯示 HTML 表格與 CSV
+    // 顯示 HTML 表格 + 下載 Excel
     let html = "<table border='1' style='border-collapse:collapse'>\n";
     for (const row of rowsText){
       html += "  <tr>" + row.map(t=>`<td style="padding:4px 8px">${escapeHtml(t)}</td>`).join("") + "</tr>\n";
@@ -366,7 +410,6 @@ tableBtn.addEventListener("click", async () => {
     preHtml.innerHTML = html;
     result.insertAdjacentElement("afterend", preHtml);
 
-    // 下載 Excel 按鈕
     const dlBtn = document.createElement("button");
     dlBtn.textContent = "下載 Excel（.xlsx）";
     dlBtn.style.marginTop = "8px";
