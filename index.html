@@ -9,20 +9,18 @@
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#0ea5e9">
   <meta name="mobile-web-app-capable" content="yes">
-  <!-- 可留著舊的 apple-*，但 Safari 會顯示 deprecated 警告；不影響功能 -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
-  <!-- 補站台 icon，避免 favicon.ico 404 -->
   <link rel="icon" href="icons/icon-192.png">
 
-  <!-- CSP：允許 jsDelivr & 你的 Pages 網域；允許 wasm instantiate -->
+  <!-- CSP，允許 cdn.jsdelivr.net 與 cdnjs.cloudflare.com -->
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'self';
              img-src 'self' blob: data:;
-             script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval' 'unsafe-eval';
+             script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com 'wasm-unsafe-eval' 'unsafe-eval';
              style-src 'self' 'unsafe-inline';
-             connect-src 'self' https://cdn.jsdelivr.net https://claire826086.github.io;
+             connect-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://claire826086.github.io;
              worker-src 'self' blob:;">
 
   <link rel="stylesheet" href="style.css">
@@ -66,8 +64,8 @@
     <small>© 2025 Contract OCR PWA • 完全離線示範</small>
   </footer>
 
-  <!-- 先載 ORT，再載你的 app.js（加版本號避免快取） -->
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
-  <script src="app.js?v=11"></script>
+  <!-- ORT 主程式 -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>
