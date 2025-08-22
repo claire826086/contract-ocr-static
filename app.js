@@ -1,7 +1,6 @@
-// app.js — PP-OCR det→post→grid→(rec) + 匯出 Excel
+// app.js — det→post→grid→(rec) + 去格線(OpenCV.js) + 匯出 Excel
 // 需於 index.html 先載入：
-// <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
-// <script src="https://cdn.jsdelivr.net/npm/xlsx@0.20.3/dist/xlsx.full.min.js"></script>
+//   onnxruntime-web、xlsx（SheetJS）、@techstark/opencv-js
 
 // ====== ORT 設定 ======
 if (window.ort) {
@@ -22,7 +21,7 @@ const result    = document.getElementById("result");
 
 // 主流程按鈕
 const tableBtn = document.createElement("button");
-tableBtn.textContent = "表格抽取（Paddle det→post→(rec)）";
+tableBtn.textContent = "表格抽取（Paddle det→(去格線)→rec）";
 tableBtn.style.marginTop = "8px";
 ocrBtn.insertAdjacentElement("afterend", tableBtn);
 
@@ -227,13 +226,67 @@ function ctcDecode(seq, keys, blankIndex=0){
   return out.join("");
 }
 
+// ====== 去格線 + 增強（OpenCV.js）======
+function enhanceCellWithOpenCV(inCanvas){
+  if (!window.cv || !cv.Mat) return inCanvas; // OpenCV 還沒載好就略過
+  const src = cv.imread(inCanvas);            // RGBA
+  let gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+
+  // 自動二值（自適應），去掉背景陰影
+  let bw = new cv.Mat();
+  cv.adaptiveThreshold(gray, bw, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 15, 10);
+
+  // 取出水平線
+  let horizontals = new cv.Mat();
+  const hSize = Math.max(10, Math.floor(inCanvas.width / 30)); // 視寬度而定
+  let hKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(hSize, 1));
+  cv.morphologyEx(bw, horizontals, cv.MORPH_OPEN, hKernel);
+
+  // 取出垂直線
+  let verticals = new cv.Mat();
+  const vSize = Math.max(10, Math.floor(inCanvas.height / 30));
+  let vKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, vSize));
+  cv.morphologyEx(bw, verticals, cv.MORPH_OPEN, vKernel);
+
+  // 合併線條
+  let lines = new cv.Mat();
+  cv.bitwise_or(horizontals, verticals, lines);
+
+  // 從原圖（灰階）中去除線條：把線條位置塗白
+  let invLines = new cv.Mat();
+  cv.bitwise_not(lines, invLines);
+  let clean = new cv.Mat();
+  cv.bitwise_and(gray, invLines, clean);
+
+  // 再做一次強化：直方圖均衡 + Otsu 二值
+  let eq = new cv.Mat();
+  cv.equalizeHist(clean, eq);
+  let final = new cv.Mat();
+  cv.threshold(eq, final, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+
+  const outCanvas = document.createElement("canvas");
+  outCanvas.width = inCanvas.width; outCanvas.height = inCanvas.height;
+  cv.imshow(outCanvas, final);
+
+  // 釋放
+  src.delete(); gray.delete(); bw.delete();
+  horizontals.delete(); verticals.delete(); lines.delete();
+  invLines.delete(); clean.delete(); eq.delete(); final.delete();
+
+  return outCanvas;
+}
+
 // 核心：單格 rec（H=48、(x-0.5)/0.5、輸出形狀自動判定、blank 自動判定）
 async function recognizeCrop(canvas){
   if (!recSession || !keys) return "";
 
+  // 先去格線增強
+  const pre = enhanceCellWithOpenCV(canvas);
+
   const targetH = 48, maxW = 512;
-  const scale = targetH / canvas.height;
-  let newW = Math.max(16, Math.min(maxW, Math.round(canvas.width * scale)));
+  const scale = targetH / pre.height;
+  let newW = Math.max(16, Math.min(maxW, Math.round(pre.width * scale)));
 
   const c = document.createElement("canvas");
   c.width = newW; c.height = targetH;
@@ -243,7 +296,7 @@ async function recognizeCrop(canvas){
   g.fillRect(0, 0, newW, targetH);
   g.imageSmoothingEnabled = true;
   g.imageSmoothingQuality = "high";
-  g.drawImage(canvas, 0, 0, newW, targetH);
+  g.drawImage(pre, 0, 0, newW, targetH);
 
   const data = g.getImageData(0,0,newW,targetH).data;
   const f32 = new Float32Array(3*targetH*newW);
@@ -378,7 +431,7 @@ tableBtn.addEventListener("click", async () => {
       Math.round(imageElement.naturalWidth/180)
     );
 
-    // 逐格裁切 → (rec) → rowsText
+    // 逐格裁切 → (去格線增強) → (rec) → rowsText
     const tmpCanvas = document.createElement("canvas");
     const tmpCtx = tmpCanvas.getContext("2d");
     const rowsText = [];
