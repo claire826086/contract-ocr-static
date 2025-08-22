@@ -157,7 +157,7 @@ fastBtn.addEventListener("click", async () => {
   progressBar.removeAttribute("value");
 
   try {
-    const { data } = await Tesseract.recognize(preview, 'eng', {
+    const { data } = await Tesseract.recognize(preview, 'chi_tra', {
       logger: m => {
         // m.status: 'loading tesseract core' | 'initializing api' | 'recognizing text'...
         // m.progress: 0~1
