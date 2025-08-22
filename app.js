@@ -1,30 +1,28 @@
-// app.js - PaddleOCR det 模型（det-only）測試版
+// app.js - PaddleOCR det 模型測試版（CDN 直連 wasm/mjs）
 
-// === ORT 設定：本機載入非 SIMD、單執行緒，避免 cross-origin 動態 import ===
 if (window.ort) {
-  // 指向你repo的 /wasm/（裡面要有 ort-wasm.jsep.mjs 與 ort-wasm.wasm）
-  ort.env.wasm.wasmPaths = "./wasm/";
-  ort.env.wasm.numThreads = 1;   // iOS 無 threads
-  ort.env.wasm.proxy = false;    // 可選：避免 worker 路徑
-  // 不設定 simd，讓它以非 SIMD 變體（ort-wasm.*）為主
+  // 指定 cdnjs 的 .mjs / .wasm
+  ort.env.wasm.wasmPaths = {
+    mjs:  "https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.22.0/ort-wasm-simd-threaded.jsep.mjs",
+    wasm: "https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.22.0/ort-wasm-simd-threaded.jsep.wasm"
+  };
+  ort.env.wasm.numThreads = 1;   // iOS 不支援多執行緒
 } else {
-  console.warn("onnxruntime-web 未載入（請確認 index.html 先載入 ort.min.js 再載入 app.js）");
+  console.warn("onnxruntime-web 未載入");
 }
 
-// === DOM ===
 const fileInput = document.getElementById("fileInput");
 const preview   = document.getElementById("preview");
 const ocrBtn    = document.getElementById("ocrBtn");
 const result    = document.getElementById("result");
 
-// === 狀態 ===
 let detSession = null;
 let imageElement = null;
 
-// 你的模型（放在 GitHub Pages，同網域）
+// 你的模型放在 GitHub Pages
 const DET_URL = "https://claire826086.github.io/contract-ocr-static/models/det.onnx";
 
-// 檔案選擇 + 預覽
+// 圖片選擇 + 預覽
 fileInput.addEventListener("change", (event) => {
   const file = event.target.files?.[0];
   if (!file) return;
@@ -39,11 +37,11 @@ fileInput.addEventListener("change", (event) => {
   reader.readAsDataURL(file);
 });
 
-// 開始 OCR（det 測試）
+// 按下「開始 OCR」
 ocrBtn.addEventListener("click", async () => {
   if (!imageElement) return alert("請先上傳照片");
   if (!window.ort) {
-    result.innerText = "❌ 無法載入 onnxruntime-web（請檢查 <script src> 與 CSP）";
+    result.innerText = "❌ 無法載入 onnxruntime-web";
     return;
   }
 
@@ -52,14 +50,13 @@ ocrBtn.addEventListener("click", async () => {
     if (!detSession) {
       detSession = await ort.InferenceSession.create(
         DET_URL,
-        { executionProviders: ['wasm'] } // 僅使用 WASM 後端
+        { executionProviders: ['wasm'] }
       );
     }
 
     result.innerText = "✅ 模型載入完成，開始推論...";
     const inputTensor = imageToTensor(imageElement);
 
-    // 自動對齊模型的輸入名稱
     const feeds = {};
     feeds[detSession.inputNames[0]] = inputTensor;
 
@@ -72,7 +69,7 @@ ocrBtn.addEventListener("click", async () => {
   }
 });
 
-// 影像轉 Tensor（640x640，RGB/255）
+// 把圖片轉成 Tensor
 function imageToTensor(img) {
   const target = 640;
   const canvas = document.createElement("canvas");
