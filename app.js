@@ -134,7 +134,10 @@ ocrBtn.addEventListener("click", async () => {
 
 // === 圖片轉 Tensor（640x640，RGB/255；等比置中，填黑） ===
 function imageToTensor(img) {
+  // 目標尺寸（需與 det.onnx 相符；DB/PP-OCRv3 常用 640）
   const target = 640;
+
+  // 1) 等比縮放 + letterbox（黑底置中）
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
   canvas.width = target;
@@ -150,12 +153,32 @@ function imageToTensor(img) {
   ctx.fillRect(0, 0, target, target);
   ctx.drawImage(img, dx, dy, w, h);
 
+  // 2) 取得像素資料（RGB）
   const data = ctx.getImageData(0, 0, target, target).data;
-  const f32 = new Float32Array(target * target * 3);
-  for (let i = 0; i < target * target; i++) {
-    f32[i * 3 + 0] = data[i * 4 + 0] / 255;
-    f32[i * 3 + 1] = data[i * 4 + 1] / 255;
-    f32[i * 3 + 2] = data[i * 4 + 2] / 255;
+
+  // 3) /255 → 減均值 → 除標準差（ImageNet）
+  //    mean = [0.485, 0.456, 0.406]
+  //    std  = [0.229, 0.224, 0.225]
+  const mean = [0.485, 0.456, 0.406];
+  const std  = [0.229, 0.224, 0.225];
+
+  // 4) HWC → CHW，輸出 shape [1, 3, H, W]
+  const out = new Float32Array(3 * target * target);
+  let p = 0;
+  for (let y = 0; y < target; y++) {
+    for (let x = 0; x < target; x++) {
+      const i = (y * target + x) * 4;
+      const r = data[i] / 255;
+      const g = data[i + 1] / 255;
+      const b = data[i + 2] / 255;
+
+      out[0 * target * target + p] = (r - mean[0]) / std[0]; // R
+      out[1 * target * target + p] = (g - mean[1]) / std[1]; // G
+      out[2 * target * target + p] = (b - mean[2]) / std[2]; // B
+
+      p++;
+    }
   }
-  return new ort.Tensor("float32", f32, [1, 3, target, target]);
+
+  return new ort.Tensor("float32", out, [1, 3, target, target]);
 }
