@@ -1,5 +1,6 @@
-// app.js — det(DB) → postprocess(unclip/axis-aligned fallback) → rotated crop → (cls 可選) → rec
-// 需在 index.html 先載入：onnxruntime-web、xlsx、opencv.js
+// app.js — det(DB) → postprocess(unclip/axis-fallback) → rotated crop → (cls 可選) → rec
+// 並新增：rec.onnx 與 ppocr_keys_v1.txt 相容性檢查（C vs keys.length）
+// 需於 index.html 先載入：onnxruntime-web、xlsx、opencv.js
 
 /******** ORT 設定 ********/
 if (window.ort) {
@@ -36,6 +37,7 @@ let recSession = null;
 let clsSession = null; // 可選
 let keys = null;
 let imageElement = null;
+let recClassCount = null; // 由檢查流程寫入，用於提示/除錯
 
 // 自動取當前 Pages 根路徑
 const BASE = location.origin + location.pathname.replace(/\/[^/]*$/, "/");
@@ -86,7 +88,7 @@ async function fetchWithProgress(url, label="下載中") {
   return out.buffer;
 }
 
-/******** 等待 OpenCV ready ********/
+/******** 等待 OpenCV ready（最多 6s） ********/
 function waitForOpenCV(maxWaitMs = 6000) {
   return new Promise((resolve) => {
     const start = performance.now();
@@ -238,7 +240,6 @@ function cropRotatedRectFromImage(imgEl, rbOrig) {
   const src = cv.imread(imgEl); // RGBA
   const center = new cv.Point(rbOrig.cx, rbOrig.cy);
   const size  = new cv.Size(Math.max(1, rbOrig.w), Math.max(1, rbOrig.h));
-  // OpenCV 的角度慣例：視情況可能需要 +90；先試原值，若效果差再改。
   const angle = rbOrig.angle;
 
   const M = cv.getRotationMatrix2D(center, angle, 1.0);
@@ -389,14 +390,18 @@ async function recognizeCanvas(canvas){
   const dims=logits.dims.slice(); const A=logits.data;
 
   let T,C,step;
-  if (dims.length===3 && dims[0]===1){ // [1,T,C] or [1,C,T]
+  if (dims.length===3 && dims[0]===1){
     if (dims[1]>1 && dims[2]>1){ T=dims[1]; C=dims[2]; step=(t,c)=>A[t*C+c]; }
     else { C=dims[1]; T=dims[2]; step=(t,c)=>A[c*T+t]; }
-  } else if (dims.length===2){ // [T,C] or [C,T]
+  } else if (dims.length===2){
     if (dims[0]>1 && dims[1]>1){ T=dims[0]; C=dims[1]; step=(t,c)=>A[t*C+c]; }
     else { C=dims[0]; T=dims[1]; step=(t,c)=>A[c*T+t]; }
   } else { console.warn("未知 rec 形狀", dims); return ""; }
 
+  // 記錄 C（供除錯）
+  recClassCount = C;
+
+  // blank index：若 C = keys.length + 1，通常 blank 在最後
   let blankIndex = 0;
   if (C === keys.length + 1) blankIndex = C - 1;
 
@@ -407,6 +412,33 @@ async function recognizeCanvas(canvas){
     seq[t]=bestI;
   }
   return ctcDecode(seq, keys, blankIndex);
+}
+
+/******** 新增：檢查 rec.onnx 與 keys 是否相容 ********/
+async function verifyRecModelCompatibility() {
+  // 準備一張極小的白底圖跑 rec 取得輸出維度
+  const test = document.createElement("canvas");
+  const targetH = 48, testW = 64;
+  test.width = testW; test.height = targetH;
+  const g = test.getContext("2d");
+  g.fillStyle = "#fff"; g.fillRect(0,0,testW,targetH);
+  const txt = await recognizeCanvas(test); // 這一步也會把 recClassCount 寫入（由 recognizeCanvas 內）
+
+  // recClassCount 由 recognizeCanvas 計算得到的 C
+  if (typeof recClassCount !== "number") {
+    console.warn("無法取得 rec 的 class 維度 C");
+    return { ok: false, C: null, reason: "無法取得 rec 的輸出維度" };
+  }
+  const K = keys.length;
+  const ok = (recClassCount === K) || (recClassCount === K + 1);
+
+  if (!ok) {
+    console.error(`[模型不相容] rec 的類別數 C=${recClassCount}，但 keys.length=${K}（差值 ${recClassCount-K}）`);
+    result.textContent = `❌ 模型不是中文或與字典不相容（C=${recClassCount}，keys=${K}）。請換中文 rec.onnx 或相符的 ppocr_keys_v1.txt。`;
+  } else {
+    console.log(`[模型相容] C=${recClassCount}，keys=${K}`);
+  }
+  return { ok, C: recClassCount, K, sampleText: txt };
 }
 
 /******** 視覺化 ********/
@@ -453,6 +485,13 @@ tableBtn.addEventListener("click", async () => {
       recSession = await ort.InferenceSession.create(buf, { executionProviders: ["wasm"] });
       keys = await loadKeys();
       console.log("keys.length =", keys.length);
+
+      // ★ 新增：檢查 rec/keys 相容性
+      const chk = await verifyRecModelCompatibility();
+      if (!chk.ok) {
+        // 不相容時直接中止，避免你看到一堆亂碼
+        return;
+      }
     }
     if (!clsSession) {
       try {
