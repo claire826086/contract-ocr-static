@@ -1,5 +1,5 @@
-// app.js — PP-OCR det(DB)→postprocess(unclip)→rotated crop→(cls)→rec→表格 + 下載 Excel
-// 先在 index.html 載入：onnxruntime-web、xlsx（SheetJS）、@techstark/opencv-js
+// app.js — det(DB) → postprocess(unclip/axis-aligned fallback) → rotated crop → (cls 可選) → rec
+// 需在 index.html 先載入：onnxruntime-web、xlsx、opencv.js
 
 /******** ORT 設定 ********/
 if (window.ort) {
@@ -15,12 +15,12 @@ if (window.ort) {
 /******** DOM ********/
 const fileInput = document.getElementById("fileInput");
 const preview   = document.getElementById("preview");
-const ocrBtn    = document.getElementById("ocrBtn"); // det 測試（保留）
+const ocrBtn    = document.getElementById("ocrBtn");   // det 測試（保留）
 const result    = document.getElementById("result");
 
 // 主流程按鈕
 const tableBtn = document.createElement("button");
-tableBtn.textContent = "表格抽取（det→unclip→(cls)→rec）";
+tableBtn.textContent = "表格抽取（det→post→rec）";
 tableBtn.style.marginTop = "8px";
 ocrBtn.insertAdjacentElement("afterend", tableBtn);
 
@@ -33,8 +33,8 @@ result.insertAdjacentElement("beforebegin", progressBar);
 /******** 全域狀態 ********/
 let detSession = null;
 let recSession = null;
-let clsSession = null;
-let keys = null;      // rec 字典
+let clsSession = null; // 可選
+let keys = null;
 let imageElement = null;
 
 // 自動取當前 Pages 根路徑
@@ -59,7 +59,7 @@ fileInput.addEventListener("change", (event) => {
   reader.readAsDataURL(file);
 });
 
-/******** 小工具：下載（帶進度） ********/
+/******** 工具：進度下載 ********/
 async function fetchWithProgress(url, label="下載中") {
   result.textContent = `🔄 ${label}…`;
   const resp = await fetch(url, { cache: "force-cache" });
@@ -84,6 +84,18 @@ async function fetchWithProgress(url, label="下載中") {
   let offset = 0;
   for (const c of chunks) { out.set(c, offset); offset += c.length; }
   return out.buffer;
+}
+
+/******** 等待 OpenCV ready ********/
+function waitForOpenCV(maxWaitMs = 6000) {
+  return new Promise((resolve) => {
+    const start = performance.now();
+    (function loop(){
+      if (window.cv && cv.Mat) return resolve(true);
+      if (performance.now() - start > maxWaitMs) return resolve(false);
+      setTimeout(loop, 200);
+    })();
+  });
 }
 
 /******** det 前處理（640×640，letterbox，RGB/255） ********/
@@ -115,27 +127,72 @@ function imageToDetTensor(img) {
   return { tensor: new ort.Tensor("float32", f32, [1,3,target,target]), dx, dy, scale, w, h };
 }
 
-/******** DB 後處理：用 OpenCV 取輪廓 + minAreaRect + unclip ********/
-/* detOutMap: ort.Tensor [1,1,H,W] 值域[0,1]
-   回傳 rotated rect 陣列：{cx,cy,w,h,angle} 在 640x640 座標系 */
-function dbPostprocessToRBoxes(detOutMap, binThr=0.25, unclipRatio=1.6, minBox=8) {
-  if (!window.cv || !cv.Mat) {
-    console.warn("OpenCV 尚未就緒，fallback 以 axis-aligned boxes");
-    // 簡化：回傳空
-    return [];
+/******** 簡易（軸對齊）後處理：二值 + 連通區外接矩形 ********/
+function probMapToBoxes_AABB(detTensor, thr=0.18, minArea=40) {
+  const [_, __, H, W] = detTensor.dims;
+  const src = detTensor.data;
+  const bin = new Uint8Array(H*W);
+  for (let i=0;i<H*W;i++) bin[i] = src[i] >= thr ? 1 : 0;
+
+  const labels = new Int32Array(H*W).fill(0);
+  let cur = 0;
+  const boxes = [];
+  const qx = new Int32Array(H*W);
+  const qy = new Int32Array(H*W);
+
+  for (let y=0;y<H;y++){
+    for (let x=0;x<W;x++){
+      const idx = y*W + x;
+      if (bin[idx]===0 || labels[idx]!==0) continue;
+      cur++;
+      let head=0, tail=0;
+      qx[tail]=x; qy[tail]=y; tail++;
+      labels[idx]=cur;
+      let minx=x, miny=y, maxx=x, maxy=y, area=0;
+      while(head<tail){
+        const cx=qx[head], cy=qy[head]; head++;
+        area++;
+        const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+        for (const [dx,dy] of dirs){
+          const nx=cx+dx, ny=cy+dy;
+          if (nx<0||nx>=W||ny<0||ny>=H) continue;
+          const nidx=ny*W+nx;
+          if (bin[nidx]===1 && labels[nidx]===0){
+            labels[nidx]=cur;
+            qx[tail]=nx; qy[tail]=ny; tail++;
+            if (nx<minx) minx=nx; if (ny<miny) miny=ny;
+            if (nx>maxx) maxx=nx; if (ny>maxy) maxy=ny;
+          }
+        }
+      }
+      if (area>=minArea){
+        boxes.push({x0:minx, y0:miny, x1:maxx+1, y1:maxy+1, area});
+      }
+    }
   }
+  boxes.sort((a,b)=>{
+    const cyA = (a.y0+a.y1)/2, cyB=(b.y0+b.y1)/2;
+    if (Math.abs(cyA-cyB)>10) return cyA-cyB;
+    return a.x0-b.x0;
+  });
+  // 轉成 rotated-box 形式（角度 0）
+  return boxes.map(b=>({
+    cx:(b.x0+b.x1)/2, cy:(b.y0+b.y1)/2,
+    w: b.x1-b.x0, h: b.y1-b.y0, angle: 0
+  }));
+}
+
+/******** DB 後處理（OpenCV）：輪廓 + minAreaRect + unclip ********/
+function dbPostprocess_RBOX(detOutMap, binThr=0.22, unclipRatio=1.8, minBox=6) {
   const [_, __, H, W] = detOutMap.dims;
   const prob = detOutMap.data; // H*W
-  // 轉成 Mat 單通道
   const mat = cv.matFromArray(H, W, cv.CV_32FC1, prob);
-  // 閾值 → 二值
+
   let bin = new cv.Mat();
   cv.threshold(mat, bin, binThr, 1.0, cv.THRESH_BINARY);
-  // 放大到 0~255
   let bin8 = new cv.Mat();
   bin.convertTo(bin8, cv.CV_8UC1, 255, 0);
 
-  // 找輪廓
   let contours = new cv.MatVector();
   let hierarchy = new cv.Mat();
   cv.findContours(bin8, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
@@ -143,11 +200,11 @@ function dbPostprocessToRBoxes(detOutMap, binThr=0.25, unclipRatio=1.6, minBox=8
   const rboxes = [];
   for (let i=0; i<contours.size(); i++){
     const cnt = contours.get(i);
-    const rect = cv.minAreaRect(cnt); // {center:{x,y}, size:{width,height}, angle}
+    const rect = cv.minAreaRect(cnt);
     let w = rect.size.width, h = rect.size.height;
     if (Math.min(w,h) < minBox) { cnt.delete(); continue; }
 
-    // unclip：把短邊乘上 ratio
+    // unclip：用短邊近似
     const r = Math.sqrt(w*h) * (unclipRatio - 1);
     w = Math.max(1, w + r);
     h = Math.max(1, h + r);
@@ -155,7 +212,7 @@ function dbPostprocessToRBoxes(detOutMap, binThr=0.25, unclipRatio=1.6, minBox=8
     rboxes.push({
       cx: rect.center.x, cy: rect.center.y,
       w, h,
-      angle: rect.angle // OpenCV 角度，順時針為正/負依版本，下面會處理
+      angle: rect.angle // 角度單位：deg
     });
     cnt.delete();
   }
@@ -163,9 +220,9 @@ function dbPostprocessToRBoxes(detOutMap, binThr=0.25, unclipRatio=1.6, minBox=8
   return rboxes;
 }
 
-/******** 將 det 座標還原到原圖 ********/
+/******** 座標還原到原圖 ********/
 function rboxToOriginal(rb, meta) {
-  const {dx, dy, scale} = meta; // 640座標 → 原圖
+  const {dx, dy, scale} = meta;
   return {
     cx: Math.round((rb.cx - dx) / scale),
     cy: Math.round((rb.cy - dy) / scale),
@@ -175,49 +232,42 @@ function rboxToOriginal(rb, meta) {
   };
 }
 
-/******** 旋轉裁切（依 minAreaRect） ********/
+/******** 旋轉裁切 ********/
 function cropRotatedRectFromImage(imgEl, rbOrig) {
   if (!window.cv || !cv.Mat) return null;
   const src = cv.imread(imgEl); // RGBA
   const center = new cv.Point(rbOrig.cx, rbOrig.cy);
-  // OpenCV 的 angle：對於直立字串，minAreaRect 可能給 -90~0；這裡把盒子轉成水平
-  const angle = rbOrig.angle; // 直接用；如果方向怪可以 +90 or -90 微調
-  const size  = new cv.Size(rbOrig.w, rbOrig.h);
+  const size  = new cv.Size(Math.max(1, rbOrig.w), Math.max(1, rbOrig.h));
+  // OpenCV 的角度慣例：視情況可能需要 +90；先試原值，若效果差再改。
+  const angle = rbOrig.angle;
 
-  // 先做旋轉
   const M = cv.getRotationMatrix2D(center, angle, 1.0);
   let rotated = new cv.Mat();
   cv.warpAffine(src, rotated, M, src.size(), cv.INTER_CUBIC, cv.BORDER_REPLICATE, new cv.Scalar());
-  // 從旋轉後圖上擷取水平矩形
-  let out = new cv.Mat();
   const roi = new cv.Rect(
     Math.max(0, Math.round(center.x - size.width/2)),
     Math.max(0, Math.round(center.y - size.height/2)),
     Math.max(1, Math.round(size.width)),
     Math.max(1, Math.round(size.height))
   );
-  // 防越界
   const safeRect = new cv.Rect(
     Math.min(Math.max(roi.x, 0), Math.max(0, rotated.cols-1)),
     Math.min(Math.max(roi.y, 0), Math.max(0, rotated.rows-1)),
     Math.min(roi.width,  rotated.cols - Math.min(Math.max(roi.x,0), rotated.cols-1)),
     Math.min(roi.height, rotated.rows - Math.min(Math.max(roi.y,0), rotated.rows-1))
   );
-  out = rotated.roi(safeRect);
+  const out = rotated.roi(safeRect);
 
-  // 輸出到 canvas
   const can = document.createElement("canvas");
   can.width = out.cols; can.height = out.rows;
   cv.imshow(can, out);
 
-  // 釋放
   src.delete(); rotated.delete(); out.delete(); M.delete();
   return can;
 }
 
-/******** 行/列分群：以文字塊中心排序（粗略） ********/
-function groupToGridFromRBoxes(rboxesOrig, yTol=12, xTol=12){
-  // 將 rbox 轉成 axis-aligned box 用於分群
+/******** 行列分群（簡化） ********/
+function gridFromRBoxes(rboxesOrig, yTol=12, xTol=12){
   const boxes = rboxesOrig.map(rb => ({
     x0: Math.round(rb.cx - rb.w/2),
     y0: Math.round(rb.cy - rb.h/2),
@@ -237,7 +287,6 @@ function groupToGridFromRBoxes(rboxesOrig, yTol=12, xTol=12){
   rows.sort((a,b)=>a.cy-b.cy);
   return rows.map(r=>{
     r.cells.sort((a,b)=>a.x0-b.x0);
-    // 合併相鄰
     const merged = [];
     for (const c of r.cells){
       const last = merged[merged.length-1];
@@ -252,19 +301,17 @@ function groupToGridFromRBoxes(rboxesOrig, yTol=12, xTol=12){
         merged.push(c);
       }
     }
-    return merged.map(m => m.rb); // 回傳此列的 rboxes
+    return merged.map(m => m.rb);
   });
 }
 
-/******** rec：讀字典 + CTC 解碼 ********/
+/******** keys + CTC ********/
 async function loadKeys() {
   const txt = await (await fetch(KEYS_URL, {cache:"force-cache"})).text();
   return txt.split(/\r?\n/).map(s=>s.trim()).filter(s => s.length>0 && !s.startsWith("#"));
 }
-
 function ctcDecode(seq, keys, blankIndex=0){
-  const out = [];
-  let prev = -1;
+  const out = []; let prev = -1;
   for (const k of seq){
     if (k === blankIndex || k === prev) { prev = k; continue; }
     prev = k; out.push(keys[k] ?? "");
@@ -272,16 +319,14 @@ function ctcDecode(seq, keys, blankIndex=0){
   return out.join("");
 }
 
-/******** cls：方向分類（可選） ********/
+/******** cls（可選） ********/
 async function runClsIfReady(canvas){
-  if (!clsSession) return canvas; // 未啟用就跳過
-  // PP-OCR cls 預處理：RGB /255 → (x-0.5)/0.5，輸入常見 48×192
+  if (!clsSession) return canvas;
   const targetH = 48, targetW = 192;
   const c = document.createElement("canvas");
   c.width = targetW; c.height = targetH;
   const g = c.getContext("2d");
   g.fillStyle = "#fff"; g.fillRect(0,0,targetW,targetH);
-  g.imageSmoothingEnabled = true; g.imageSmoothingQuality = "high";
   const scale = Math.min(targetW/canvas.width, targetH/canvas.height);
   const w = Math.round(canvas.width*scale), h = Math.round(canvas.height*scale);
   g.drawImage(canvas, Math.floor((targetW-w)/2), Math.floor((targetH-h)/2), w, h);
@@ -289,38 +334,31 @@ async function runClsIfReady(canvas){
   const data = g.getImageData(0,0,targetW,targetH).data;
   const f32 = new Float32Array(3*targetH*targetW);
   let p = 0;
-  for (let y=0;y<targetH;y++){
-    for (let x=0;x<targetW;x++){
-      const i=(y*targetW+x)*4;
-      f32[0*targetH*targetW + p] = (data[i  ]/255-0.5)/0.5;
-      f32[1*targetH*targetW + p] = (data[i+1]/255-0.5)/0.5;
-      f32[2*targetH*targetW + p] = (data[i+2]/255-0.5)/0.5;
-      p++;
-    }
+  for (let y=0;y<targetH;y++)for (let x=0;x<targetW;x++){
+    const i=(y*targetW+x)*4;
+    f32[0*targetH*targetW+p]=(data[i  ]/255-0.5)/0.5;
+    f32[1*targetH*targetW+p]=(data[i+1]/255-0.5)/0.5;
+    f32[2*targetH*targetW+p]=(data[i+2]/255-0.5)/0.5;
+    p++;
   }
-  const input = new ort.Tensor("float32", f32, [1,3,targetH,targetW]);
-  const feeds = {}; feeds[clsSession.inputNames[0]] = input;
-  const out = await clsSession.run(feeds);
-  const name = Object.keys(out)[0];
-  const logits = out[name].data;
-  // 2 類：0 正，1 180 或 90（依模型）；這裡簡化成若第1類較大就把圖旋轉180。
-  if (logits.length>=2 && logits[1] > logits[0]) {
-    const rot = document.createElement("canvas");
-    rot.width = canvas.width; rot.height = canvas.height;
-    const rg = rot.getContext("2d");
-    rg.translate(rot.width/2, rot.height/2);
-    rg.rotate(Math.PI); // 180deg
+  const input=new ort.Tensor("float32",f32,[1,3,targetH,targetW]);
+  const feeds={}; feeds[clsSession.inputNames[0]]=input;
+  const out=await clsSession.run(feeds);
+  const name=Object.keys(out)[0]; const logits=out[name].data;
+  if (logits.length>=2 && logits[1]>logits[0]) {
+    const rot=document.createElement("canvas");
+    rot.width=canvas.width; rot.height=canvas.height;
+    const rg=rot.getContext("2d");
+    rg.translate(rot.width/2, rot.height/2); rg.rotate(Math.PI); // 180deg
     rg.drawImage(canvas, -canvas.width/2, -canvas.height/2);
     return rot;
   }
   return canvas;
 }
 
-/******** 單格 rec（H=48、(x-0.5)/0.5、自動判 shape、blank 推斷） ********/
+/******** rec（H=48，(x-0.5)/0.5，自動 shape/blank） ********/
 async function recognizeCanvas(canvas){
   if (!recSession || !keys) return "";
-
-  // 先跑 cls（若有）
   const pre = await runClsIfReady(canvas);
 
   const targetH = 48, maxW = 512;
@@ -330,53 +368,48 @@ async function recognizeCanvas(canvas){
   const c = document.createElement("canvas");
   c.width = newW; c.height = targetH;
   const g = c.getContext("2d");
-  g.fillStyle = "#fff"; g.fillRect(0, 0, newW, targetH);
+  g.fillStyle = "#fff"; g.fillRect(0,0,newW,targetH);
   g.imageSmoothingEnabled = true; g.imageSmoothingQuality = "high";
   g.drawImage(pre, 0, 0, newW, targetH);
 
   const data = g.getImageData(0,0,newW,targetH).data;
   const f32 = new Float32Array(3*targetH*newW);
   let p = 0;
-  for (let y=0;y<targetH;y++){
-    for (let x=0;x<newW;x++){
-      const i=(y*newW+x)*4;
-      f32[0*targetH*newW + p] = (data[i  ]/255-0.5)/0.5;
-      f32[1*targetH*newW + p] = (data[i+1]/255-0.5)/0.5;
-      f32[2*targetH*newW + p] = (data[i+2]/255-0.5)/0.5;
-      p++;
-    }
+  for (let y=0;y<targetH;y++)for (let x=0;x<newW;x++){
+    const i=(y*newW+x)*4;
+    f32[0*targetH*newW+p]=(data[i  ]/255-0.5)/0.5;
+    f32[1*targetH*newW+p]=(data[i+1]/255-0.5)/0.5;
+    f32[2*targetH*newW+p]=(data[i+2]/255-0.5)/0.5;
+    p++;
   }
-  const input = new ort.Tensor("float32", f32, [1,3,targetH,newW]);
-  const feeds = {}; feeds[recSession.inputNames[0]] = input;
-  const out = await recSession.run(feeds);
-  const name = Object.keys(out)[0];
-  const logits = out[name];
-  const dims = logits.dims.slice();
-  const A = logits.data;
+  const input=new ort.Tensor("float32",f32,[1,3,targetH,newW]);
+  const feeds={}; feeds[recSession.inputNames[0]]=input;
+  const out=await recSession.run(feeds);
+  const name=Object.keys(out)[0]; const logits=out[name];
+  const dims=logits.dims.slice(); const A=logits.data;
 
-  let T, C, step;
-  if (dims.length === 3 && dims[0] === 1 && dims[1] > 1 && dims[2] > 1) { T=dims[1]; C=dims[2]; step=(t,c)=>A[t*C+c]; }
-  else if (dims.length === 3 && dims[0] === 1 && dims[2] > 1 && dims[1] > 1) { C=dims[1]; T=dims[2]; step=(t,c)=>A[c*T+t]; }
-  else if (dims.length === 2 && dims[0] > 1 && dims[1] > 1) { T=dims[0]; C=dims[1]; step=(t,c)=>A[t*C+c]; }
-  else if (dims.length === 2 && dims[1] > 1 && dims[0] > 1) { C=dims[0]; T=dims[1]; step=(t,c)=>A[c*T+t]; }
-  else { console.warn("未知 rec 輸出形狀", dims); return ""; }
+  let T,C,step;
+  if (dims.length===3 && dims[0]===1){ // [1,T,C] or [1,C,T]
+    if (dims[1]>1 && dims[2]>1){ T=dims[1]; C=dims[2]; step=(t,c)=>A[t*C+c]; }
+    else { C=dims[1]; T=dims[2]; step=(t,c)=>A[c*T+t]; }
+  } else if (dims.length===2){ // [T,C] or [C,T]
+    if (dims[0]>1 && dims[1]>1){ T=dims[0]; C=dims[1]; step=(t,c)=>A[t*C+c]; }
+    else { C=dims[0]; T=dims[1]; step=(t,c)=>A[c*T+t]; }
+  } else { console.warn("未知 rec 形狀", dims); return ""; }
 
   let blankIndex = 0;
   if (C === keys.length + 1) blankIndex = C - 1;
 
   const seq = new Array(T);
-  for (let t=0; t<T; t++){
-    let bestI = 0, bestV = -Infinity;
-    for (let c2=0; c2<C; c2++){
-      const v = step(t, c2);
-      if (v > bestV){ bestV=v; bestI=c2; }
-    }
-    seq[t] = bestI;
+  for (let t=0;t<T;t++){
+    let bestI=0,bestV=-Infinity;
+    for (let c2=0;c2<C;c2++){ const v=step(t,c2); if (v>bestV){bestV=v;bestI=c2;} }
+    seq[t]=bestI;
   }
   return ctcDecode(seq, keys, blankIndex);
 }
 
-/******** 視覺化：把 rboxes 畫在預覽下方 ********/
+/******** 視覺化 ********/
 function drawRBoxesOnImage(img, rboxesOrig){
   const can = document.createElement("canvas");
   can.width = img.naturalWidth; can.height = img.naturalHeight;
@@ -392,7 +425,6 @@ function drawRBoxesOnImage(img, rboxesOrig){
     g.restore();
   });
   preview.insertAdjacentElement("afterend", can);
-  return can;
 }
 
 /******** 匯出 Excel ********/
@@ -404,17 +436,16 @@ function exportToXLSX(rowsText, filename="ocr_table.xlsx"){
   XLSX.writeFile(wb, filename);
 }
 
-/******** 主流程：det→unclip→rotated crop→(cls)→rec→表格 ********/
+/******** 主流程 ********/
 tableBtn.addEventListener("click", async () => {
   if (!imageElement) return alert("請先上傳照片");
 
   try {
-    // det
+    // 載模型
     if (!detSession) {
       const buf = await fetchWithProgress(DET_URL, "下載 det.onnx");
       detSession = await ort.InferenceSession.create(buf, { executionProviders: ["wasm"] });
     }
-    // rec + keys
     if (!recSession) {
       const head = await fetch(REC_URL, {method:"HEAD"});
       if (!head.ok) throw new Error("找不到 rec.onnx（可先只跑框）");
@@ -423,7 +454,6 @@ tableBtn.addEventListener("click", async () => {
       keys = await loadKeys();
       console.log("keys.length =", keys.length);
     }
-    // cls（可選）
     if (!clsSession) {
       try {
         const h = await fetch(CLS_URL, {method:"HEAD"});
@@ -431,7 +461,7 @@ tableBtn.addEventListener("click", async () => {
           const cbuf = await fetchWithProgress(CLS_URL, "下載 cls.onnx");
           clsSession = await ort.InferenceSession.create(cbuf, { executionProviders: ["wasm"] });
         }
-      } catch { /* ignore */ }
+      } catch {}
     }
 
     // det 推論
@@ -442,28 +472,57 @@ tableBtn.addEventListener("click", async () => {
     const detName = Object.keys(detOut)[0];
     const detMap = detOut[detName]; // [1,1,H,W]
 
-    // DB 後處理（640座標）→ 還原到原圖
-    const rboxes640 = dbPostprocessToRBoxes(detMap, /*thr=*/0.25, /*unclip=*/1.6, /*minBox=*/8);
+    // 嘗試：OpenCV RBOX → 若 0 框，再以寬鬆參數重試 → 再不行走 AABB
+    let rboxes640 = [];
+    const cvReady = await waitForOpenCV();
+    if (cvReady) {
+      rboxes640 = dbPostprocess_RBOX(detMap, 0.22, 1.8, 6);
+      if (rboxes640.length === 0) rboxes640 = dbPostprocess_RBOX(detMap, 0.18, 2.2, 4);
+    } else {
+      console.warn("OpenCV 未就緒，改用軸對齊後處理");
+    }
+    if (rboxes640.length === 0) {
+      rboxes640 = probMapToBoxes_AABB(detMap, 0.16, 30);
+    }
+    if (rboxes640.length === 0) {
+      result.textContent = "⚠️ 未偵測到文字區塊（可嘗試拍更近、更直或調高亮度）";
+      return;
+    }
+
     const rboxesOrig = rboxes640.map(rb => rboxToOriginal(rb, meta));
     drawRBoxesOnImage(imageElement, rboxesOrig);
 
-    // 依行列分群（簡化 grid）
-    const grid = groupToGridFromRBoxes(
+    // 分群成 grid
+    const grid = gridFromRBoxes(
       rboxesOrig,
       Math.round(imageElement.naturalHeight/120),
       Math.round(imageElement.naturalWidth/180)
     );
 
-    // 逐格：旋轉裁切 → (cls) → rec
+    // 逐格裁切 → (cls) → rec
+    result.textContent = "🔤 文字識別中…（格數：" + grid.reduce((a,r)=>a+r.length,0) + "）";
     const rowsText = [];
     for (const row of grid){
       const cols = [];
       for (const rb of row){
-        const crop = cropRotatedRectFromImage(imageElement, rb);
-        let text = "";
-        if (crop) {
-          try { text = await recognizeCanvas(crop) || ""; } catch(e){ console.warn("rec 失敗:", e); }
+        let crop = null;
+        if (cvReady) crop = cropRotatedRectFromImage(imageElement, rb);
+        if (!crop) { // 沒 OpenCV 就用 canvas 直接切 AABB
+          const c = document.createElement("canvas");
+          c.width = Math.max(1, Math.round(rb.w));
+          c.height= Math.max(1, Math.round(rb.h));
+          const g = c.getContext("2d");
+          g.drawImage(
+            imageElement,
+            Math.max(0, Math.round(rb.cx - rb.w/2)),
+            Math.max(0, Math.round(rb.cy - rb.h/2)),
+            Math.round(rb.w), Math.round(rb.h),
+            0, 0, Math.round(rb.w), Math.round(rb.h)
+          );
+          crop = c;
         }
+        let text = "";
+        try { text = await recognizeCanvas(crop) || ""; } catch(e){ console.warn("rec 失敗:", e); }
         cols.push(text.trim());
       }
       rowsText.push(cols);
@@ -476,7 +535,7 @@ tableBtn.addEventListener("click", async () => {
     }
     html += "</table>";
 
-    result.textContent = "✅ 完成（下方為表格 HTML），可下載 Excel";
+    result.textContent = "✅ 完成（下方為表格），可下載 Excel";
     const preHtml = document.createElement("div");
     preHtml.innerHTML = html;
     result.insertAdjacentElement("afterend", preHtml);
