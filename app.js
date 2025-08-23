@@ -1,6 +1,5 @@
 // app.js — det(DB) → postprocess(unclip/axis-fallback) → rotated crop → (cls 可選) → rec
-// 並新增：rec.onnx 與 ppocr_keys_v1.txt 相容性檢查（C vs keys.length）
-// 需於 index.html 先載入：onnxruntime-web、xlsx、opencv.js
+// 並新增：rec.onnx 與 ppocr_keys_v1.txt 相容性檢查（自動補齊差幾類）
 
 /******** ORT 設定 ********/
 if (window.ort) {
@@ -37,7 +36,7 @@ let recSession = null;
 let clsSession = null; // 可選
 let keys = null;
 let imageElement = null;
-let recClassCount = null; // 由檢查流程寫入，用於提示/除錯
+let recClassCount = null; // 由 recognizeCanvas() 寫入
 
 // 自動取當前 Pages 根路徑
 const BASE = location.origin + location.pathname.replace(/\/[^/]*$/, "/");
@@ -177,7 +176,6 @@ function probMapToBoxes_AABB(detTensor, thr=0.18, minArea=40) {
     if (Math.abs(cyA-cyB)>10) return cyA-cyB;
     return a.x0-b.x0;
   });
-  // 轉成 rotated-box 形式（角度 0）
   return boxes.map(b=>({
     cx:(b.x0+b.x1)/2, cy:(b.y0+b.y1)/2,
     w: b.x1-b.x0, h: b.y1-b.y0, angle: 0
@@ -187,7 +185,7 @@ function probMapToBoxes_AABB(detTensor, thr=0.18, minArea=40) {
 /******** DB 後處理（OpenCV）：輪廓 + minAreaRect + unclip ********/
 function dbPostprocess_RBOX(detOutMap, binThr=0.22, unclipRatio=1.8, minBox=6) {
   const [_, __, H, W] = detOutMap.dims;
-  const prob = detOutMap.data; // H*W
+  const prob = detOutMap.data;
   const mat = cv.matFromArray(H, W, cv.CV_32FC1, prob);
 
   let bin = new cv.Mat();
@@ -206,7 +204,6 @@ function dbPostprocess_RBOX(detOutMap, binThr=0.22, unclipRatio=1.8, minBox=6) {
     let w = rect.size.width, h = rect.size.height;
     if (Math.min(w,h) < minBox) { cnt.delete(); continue; }
 
-    // unclip：用短邊近似
     const r = Math.sqrt(w*h) * (unclipRatio - 1);
     w = Math.max(1, w + r);
     h = Math.max(1, h + r);
@@ -214,7 +211,7 @@ function dbPostprocess_RBOX(detOutMap, binThr=0.22, unclipRatio=1.8, minBox=6) {
     rboxes.push({
       cx: rect.center.x, cy: rect.center.y,
       w, h,
-      angle: rect.angle // 角度單位：deg
+      angle: rect.angle
     });
     cnt.delete();
   }
@@ -237,7 +234,7 @@ function rboxToOriginal(rb, meta) {
 /******** 旋轉裁切 ********/
 function cropRotatedRectFromImage(imgEl, rbOrig) {
   if (!window.cv || !cv.Mat) return null;
-  const src = cv.imread(imgEl); // RGBA
+  const src = cv.imread(imgEl);
   const center = new cv.Point(rbOrig.cx, rbOrig.cy);
   const size  = new cv.Size(Math.max(1, rbOrig.w), Math.max(1, rbOrig.h));
   const angle = rbOrig.angle;
@@ -350,7 +347,7 @@ async function runClsIfReady(canvas){
     const rot=document.createElement("canvas");
     rot.width=canvas.width; rot.height=canvas.height;
     const rg=rot.getContext("2d");
-    rg.translate(rot.width/2, rot.height/2); rg.rotate(Math.PI); // 180deg
+    rg.translate(rot.width/2, rot.height/2); rg.rotate(Math.PI);
     rg.drawImage(canvas, -canvas.width/2, -canvas.height/2);
     return rot;
   }
@@ -398,10 +395,8 @@ async function recognizeCanvas(canvas){
     else { C=dims[0]; T=dims[1]; step=(t,c)=>A[c*T+t]; }
   } else { console.warn("未知 rec 形狀", dims); return ""; }
 
-  // 記錄 C（供除錯）
-  recClassCount = C;
+  recClassCount = C; // 讓檢查流程可取得 C
 
-  // blank index：若 C = keys.length + 1，通常 blank 在最後
   let blankIndex = 0;
   if (C === keys.length + 1) blankIndex = C - 1;
 
@@ -414,31 +409,41 @@ async function recognizeCanvas(canvas){
   return ctcDecode(seq, keys, blankIndex);
 }
 
-/******** 新增：檢查 rec.onnx 與 keys 是否相容 ********/
-async function verifyRecModelCompatibility() {
-  // 準備一張極小的白底圖跑 rec 取得輸出維度
+/******** 檢查並「必要時補齊」 rec/keys 相容性 ********/
+async function verifyAndPatchRecCompatibility() {
   const test = document.createElement("canvas");
   const targetH = 48, testW = 64;
   test.width = testW; test.height = targetH;
   const g = test.getContext("2d");
   g.fillStyle = "#fff"; g.fillRect(0,0,testW,targetH);
-  const txt = await recognizeCanvas(test); // 這一步也會把 recClassCount 寫入（由 recognizeCanvas 內）
+  await recognizeCanvas(test); // 這會寫入 recClassCount
 
-  // recClassCount 由 recognizeCanvas 計算得到的 C
   if (typeof recClassCount !== "number") {
-    console.warn("無法取得 rec 的 class 維度 C");
-    return { ok: false, C: null, reason: "無法取得 rec 的輸出維度" };
+    console.warn("無法取得 rec 的輸出維度 C");
+    return { ok: false, C: null, K: keys?.length ?? 0, action: "abort" };
   }
-  const K = keys.length;
-  const ok = (recClassCount === K) || (recClassCount === K + 1);
 
-  if (!ok) {
-    console.error(`[模型不相容] rec 的類別數 C=${recClassCount}，但 keys.length=${K}（差值 ${recClassCount-K}）`);
-    result.textContent = `❌ 模型不是中文或與字典不相容（C=${recClassCount}，keys=${K}）。請換中文 rec.onnx 或相符的 ppocr_keys_v1.txt。`;
-  } else {
-    console.log(`[模型相容] C=${recClassCount}，keys=${K}`);
+  const C = recClassCount;
+  const K = keys.length;
+
+  if (C === K || C === K + 1) {
+    console.log(`[模型相容] C=${C}, keys=${K}`);
+    return { ok: true, C, K, action: "none" };
   }
-  return { ok, C: recClassCount, K, sampleText: txt };
+
+  if (C > K && (C - K) <= 8) {
+    const targetKeysLen = C - 1;
+    const need = targetKeysLen - K;
+    if (need > 0) {
+      console.warn(`⚠️ keys (${K}) 與模型類別數 (${C}) 不符；暫補 ${need} 個占位符。建議更換對版的 ppocr_keys_v1.txt。`);
+      for (let i = 0; i < need; i++) keys.push("");
+    }
+    return { ok: true, C, K: keys.length, action: "patched" };
+  }
+
+  console.error(`[不相容] C=${C}, keys=${K}。請更換「中文 rec.onnx」或對應版字典。`);
+  result.textContent = `❌ 模型與字典不相容（C=${C}、keys=${K}）。請更換「中文 rec.onnx」或對應版字典。`;
+  return { ok: false, C, K, action: "abort" };
 }
 
 /******** 視覺化 ********/
@@ -473,7 +478,6 @@ tableBtn.addEventListener("click", async () => {
   if (!imageElement) return alert("請先上傳照片");
 
   try {
-    // 載模型
     if (!detSession) {
       const buf = await fetchWithProgress(DET_URL, "下載 det.onnx");
       detSession = await ort.InferenceSession.create(buf, { executionProviders: ["wasm"] });
@@ -486,12 +490,9 @@ tableBtn.addEventListener("click", async () => {
       keys = await loadKeys();
       console.log("keys.length =", keys.length);
 
-      // ★ 新增：檢查 rec/keys 相容性
-      const chk = await verifyRecModelCompatibility();
-      if (!chk.ok) {
-        // 不相容時直接中止，避免你看到一堆亂碼
-        return;
-      }
+      // ★ 檢查並自動補齊 keys（若差距 ≤ 8）
+      const chk = await verifyAndPatchRecCompatibility();
+      if (!chk.ok && chk.action === "abort") return;
     }
     if (!clsSession) {
       try {
@@ -503,15 +504,13 @@ tableBtn.addEventListener("click", async () => {
       } catch {}
     }
 
-    // det 推論
     result.textContent = "🔎 det 推論中…";
     const meta = imageToDetTensor(imageElement);
     const feeds = {}; feeds[detSession.inputNames[0]] = meta.tensor;
     const detOut = await detSession.run(feeds);
     const detName = Object.keys(detOut)[0];
-    const detMap = detOut[detName]; // [1,1,H,W]
+    const detMap = detOut[detName];
 
-    // 嘗試：OpenCV RBOX → 若 0 框，再以寬鬆參數重試 → 再不行走 AABB
     let rboxes640 = [];
     const cvReady = await waitForOpenCV();
     if (cvReady) {
@@ -531,22 +530,20 @@ tableBtn.addEventListener("click", async () => {
     const rboxesOrig = rboxes640.map(rb => rboxToOriginal(rb, meta));
     drawRBoxesOnImage(imageElement, rboxesOrig);
 
-    // 分群成 grid
     const grid = gridFromRBoxes(
       rboxesOrig,
       Math.round(imageElement.naturalHeight/120),
       Math.round(imageElement.naturalWidth/180)
     );
 
-    // 逐格裁切 → (cls) → rec
     result.textContent = "🔤 文字識別中…（格數：" + grid.reduce((a,r)=>a+r.length,0) + "）";
     const rowsText = [];
     for (const row of grid){
       const cols = [];
       for (const rb of row){
         let crop = null;
-        if (cvReady) crop = cropRotatedRectFromImage(imageElement, rb);
-        if (!crop) { // 沒 OpenCV 就用 canvas 直接切 AABB
+        if (await waitForOpenCV()) crop = cropRotatedRectFromImage(imageElement, rb);
+        if (!crop) {
           const c = document.createElement("canvas");
           c.width = Math.max(1, Math.round(rb.w));
           c.height= Math.max(1, Math.round(rb.h));
@@ -567,7 +564,6 @@ tableBtn.addEventListener("click", async () => {
       rowsText.push(cols);
     }
 
-    // 顯示 HTML + 下載 Excel
     let html = "<table border='1' style='border-collapse:collapse'>\n";
     for (const row of rowsText){
       html += "  <tr>" + row.map(t=>`<td style="padding:4px 8px">${escapeHtml(t)}</td>`).join("") + "</tr>\n";
